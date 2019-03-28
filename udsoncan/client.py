@@ -11,7 +11,7 @@ import time
 
 class Client:
 	"""
-	__init__(self, conn, config=default_client_config, request_timeout = 1)
+	__init__(self, conn, config=default_client_config, request_timeout = None)
 
 	Object that interacts with a UDS server. 
 	It builds a service request, sends it to the server, receives and parses its response, detects communication anomalies and logs what it is doing for further debugging.
@@ -22,7 +22,7 @@ class Client:
 	:param config: The :ref:`client configuration<client_config>`
 	:type config: dict
 
-	:param request_timeout: Maximum amount of time to wait for a response after sending a request (in seconds). After this time is elapsed, a TimeoutException will be raised.
+	:param request_timeout: Maximum amount of time to wait for a response. This parameter exists for backward compatibility only. For detailed timeout handling, see :ref:`Client configuration<config_timeouts>`
 	:type request_timeout: int
 	"""
 
@@ -37,10 +37,13 @@ class Client:
 		def __exit__(self, type, value, traceback):
 			self.enabled = False
 
-	def __init__(self, conn, config=default_client_config, request_timeout = 1):
+	def __init__(self, conn, config=default_client_config, request_timeout=None):
 		self.conn = conn
-		self.request_timeout = request_timeout
 		self.config = dict(config) # Makes a copy of given configuration
+		
+		#For backward compatibility
+		if request_timeout is not None:
+			self.config['request_timeout'] = request_timeout
 		self.suppress_positive_response = Client.SuppressPositiveResponse()
 		self.last_response = None
 
@@ -69,6 +72,10 @@ class Client:
 
 	def set_config(self, key, value):
 		self.config[key] = value
+		self.refresh_config()
+
+	def set_configs(self, dic):
+		self.config.update(dic)
 		self.refresh_config()
 
 	def refresh_config(self):
@@ -1409,9 +1416,16 @@ class Client:
 
 	# Basic transmission of requests. This will need to be improved
 	def send_request(self, request, timeout=-1):
-		if timeout is not None and timeout < 0:
-			timeout = self.request_timeout
-		original_timeout = timeout
+		if timeout < 0:
+			# Timeout not provided by user: defaults to Client request_timeout value
+			overall_timeout = self.config['request_timeout']
+			single_request_timeout = min(overall_timeout, self.config['p2_timeout'])
+		else:
+			overall_timeout = timeout
+			single_request_timeout = timeout
+		overall_timeout_time = time.time() + overall_timeout
+		using_p2_star = False	# Will switch to true when Nrc 0x78 will be received the first time.
+		
 		self.conn.empty_rxqueue()
 		self.logger.debug("Sending request to server")
 		override_suppress_positive_response = False
@@ -1430,19 +1444,28 @@ class Client:
 			return
 		
 		done_receiving = False
+
 		while not done_receiving:
 			done_receiving = True
 			self.logger.debug("Waiting for server response")
+
 			try:
-				rx_time = time.time()
-				payload = self.conn.wait_frame(timeout=timeout, exception=True)
-				rx_time = time.time()-rx_time
-				if timeout is not None:
-					timeout =timeout - rx_time
-					if timeout < 0:
-						raise TimeoutException('Did not receive response in time (timeout=%.3f sec)' % original_timeout)
-			except TimeoutException as e:
-				raise TimeoutException('Did not receive response in time (timeout=%.3f sec)' % original_timeout)
+				if time.time() + single_request_timeout < overall_timeout_time:	
+					timeout_type_used 	= 'single_request'
+					timeout_value 		= single_request_timeout
+				else:	
+					timeout_type_used 	= 'overall'
+					timeout_value 		= max(overall_timeout_time - time.time(), 0)
+
+				payload = self.conn.wait_frame(timeout=timeout_value, exception=True)	
+			except TimeoutException:
+				if timeout_type_used == 'single_request':
+					timeout_name_to_report = 'P2* timeout' if using_p2_star else 'P2 timeout'
+				elif timeout_type_used == 'overall':
+					timeout_name_to_report = 'Global request timeout'
+				else:	# Shouldn't go here.
+					timeout_name_to_report = 'Timeout'
+				raise TimeoutException('Did not receive response in time. %s time has expired (timeout=%.3f sec)' % (timeout_name_to_report, timeout_value))
 			except Exception as e:
 				raise e
 
@@ -1462,8 +1485,12 @@ class Client:
 					self.logger.warning('Given response code "%s" (0x%02x) is not a supported negative response code according to UDS standard.' % (response.code_name, response.code))
 
 				if response.code == Response.Code.RequestCorrectlyReceived_ResponsePending:
-					done_receiving = False
-					self.logger.debug("Server requested to wait with response code %s (0x%02x)" % (response.code_name, response.code))
+						done_receiving = False
+						if not using_p2_star:
+							# Received a 0x78 NRC: timeout is now set to P2*
+							single_request_timeout = self.config['p2_star_timeout']
+							using_p2_star = True
+							self.logger.debug("Server requested to wait with response code %s (0x%02x), single request timeout is now set to P2* (%.3f seconds)" % (response.code_name, response.code, single_request_timeout))
 				else:
 					raise NegativeResponseException(response)
 
